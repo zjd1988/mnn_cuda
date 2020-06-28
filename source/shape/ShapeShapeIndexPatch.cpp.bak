@@ -1,0 +1,33 @@
+//
+//  ShapeShape.cpp
+//  MNN
+//
+//  Created by MNN on 2019/01/10.
+//  Copyright © 2018, Alibaba Group Holding Limited
+//
+
+#include "core/Macro.h"
+#include "core/SizeComputer.hpp"
+#include "core/TensorUtils.hpp"
+
+namespace MNN {
+
+class ShapeShapeIndexPatchSizeComputer : public SizeComputer {
+    virtual bool onComputeSize(const MNN::Op* op, const std::vector<Tensor*>& inputs,
+                               const std::vector<Tensor*>& outputs) const override {
+        MNN_ASSERT(2 == inputs.size());
+        MNN_ASSERT(1 == outputs.size());
+        auto& ob = outputs[0]->buffer();
+
+        ob.dimensions = 4;
+        outputs[0]->setType(DataType_DT_FLOAT);
+        ob.dim[0].extent = 1;
+        ob.dim[1].extent = 8;
+        ob.dim[2].extent = 4;
+        ob.dim[3].extent = 20;
+        return true;
+    }
+};
+
+REGISTER_SHAPE(ShapeShapeIndexPatchSizeComputer, OpType_ShapeIndexPatch);
+} // namespace MNN

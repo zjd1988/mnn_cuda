@@ -1,0 +1,237 @@
+//
+//  mobilenetV1Test.cpp
+//  MNN
+//
+//  Created by MNN on 2018/05/14.
+//  Copyright © 2018, Alibaba Group Holding Limited
+//
+
+#include <stdio.h>
+#include <MNN/ImageProcess.hpp>
+#include <MNN/Interpreter.hpp>
+#define MNN_OPEN_TIME_TRACE
+#include <algorithm>
+#include <fstream>
+#include <functional>
+#include <memory>
+#include <sstream>
+#include <vector>
+#include <MNN/AutoTime.hpp>
+
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
+#include "stb_image_write.h"
+
+using namespace std;
+using namespace MNN;
+using namespace MNN::CV;
+#define PNET_THRESH 0.7f
+#define PNET_NMS_THRESH 0.8f
+#define NET_SIZE 12
+#define STRIDE 4
+#define SCALE 1.414f
+
+typedef struct RegRect
+{
+    int32_t x;
+    int32_t y;
+    int32_t width;
+    int32_t height;
+    int32_t scale;
+    double conf;
+    RegRect( int32_t x_ = 0, int32_t y_ = 0, int32_t w_ = 0, int32_t h_ = 0, int32_t s_ = 0, double c_ = 0 )
+        : x( x_ ), y( y_ ), width( w_ ), height( h_ ), scale( s_ ), conf( c_ ) {
+    }
+}RegRect;
+
+bool Legal( int x, int y, const int img_width, const int img_height ) {
+    if( x >= 0 && x < img_width && y >= 0 && y < img_height )
+        return true;
+    else
+        return false;
+}
+
+float IoU( const RegRect &w1, const RegRect &w2 ) {
+    int xOverlap = std::max( 0, std::min( w1.x + w1.width - 1, w2.x + w2.width - 1 ) - std::max( w1.x, w2.x ) + 1 );
+    int yOverlap = std::max( 0, std::min( w1.y + w1.height - 1, w2.y + w2.height - 1 ) - std::max( w1.y, w2.y ) + 1 );
+    int intersection = xOverlap * yOverlap;
+    int unio = w1.width * w1.height + w2.width * w2.height - intersection;
+    return float( intersection ) / unio;
+}
+
+static bool CompareWin( const RegRect &w1, const RegRect &w2 ) {
+    return w1.conf > w2.conf;
+}
+
+std::vector<RegRect> NMS( std::vector<RegRect> &winList, bool local, float threshold )
+{
+    if( winList.size() == 0 )
+        return winList;
+    std::sort( winList.begin(), winList.end(), CompareWin );
+    std::vector<bool> flag( winList.size(), false );
+    for( size_t i = 0; i < winList.size(); i++ )
+    {
+        if( flag[i] )
+            continue;
+        for( size_t j = i + 1; j < winList.size(); j++ )
+        {
+            if( local && winList[i].scale != winList[j].scale )
+                continue;
+            if( IoU( winList[i], winList[j] ) > threshold )
+                flag[j] = true;
+        }
+    }
+    std::vector<RegRect> ret;
+    for( size_t i = 0; i < winList.size(); i++ )
+    {
+        if( !flag[i] ) ret.push_back( winList[i] );
+    }
+    return ret;
+}
+
+
+void img_preprocess(const unsigned char* inputImage, int imageWidth, int imageHeight, 
+                int netInputWidth, int netInputHeight, Tensor &inputTensorUser)
+{
+    Matrix trans;
+    trans.setScale(1.0 / imageWidth, 1.0 / imageHeight);
+    trans.postRotate(0, 0.5f, 0.5f);
+    trans.postScale(netInputWidth, netInputHeight);
+    trans.invert(&trans);
+
+    ImageProcess::Config config;
+    config.filterType = BILINEAR;
+    float mean[3]     = {104.f, 117.f, 123.f};
+    float normals[3] = {1.0f, 1.0f, 1.0f};
+    ::memcpy(config.mean, mean, sizeof(mean));
+    ::memcpy(config.normal, normals, sizeof(normals));
+    config.sourceFormat = BGRA;
+    config.destFormat = RGB;
+
+    std::shared_ptr<ImageProcess> pretreat(ImageProcess::create(config));
+    pretreat->setMatrix(trans);
+    pretreat->convert(inputImage, imageWidth, imageHeight, 0, &inputTensorUser);
+    return;
+}
+
+int main(int argc, const char* argv[]) {
+
+    if (argc < 3) {
+        MNN_PRINT("Usage: ./mobilenetTest.out model.mnn input.jpg [word.txt]\n");
+        return 0;
+    }
+    std::shared_ptr<Interpreter> net(Interpreter::createFromFile(argv[1]));
+    ScheduleConfig config;
+    // config.saveTensors.push_back("14");
+    config.saveTensors.push_back("output1");
+    config.saveTensors.push_back("output2");
+    config.type  = MNN_FORWARD_CPU;
+    config.numThread = 4;
+    if (argc >= 4) {
+        config.type = (MNNForwardType)::atoi(argv[4]);
+    }
+    //init net session
+    Session* session = net->createSession(config);
+    Tensor* inputTensor  = net->getSessionInput(session, NULL);
+    Tensor* outputTensor1 = net->getSessionOutput(session, "output1");
+    Tensor* outputTensor2 = net->getSessionOutput(session, "output2");
+    // Tensor inputTensorUser(inputTensor, Tensor::DimensionType::CAFFE);
+
+
+    //get test img data
+    int imageChannel, imageWidth, imageHeight;
+    unsigned char* inputImage = stbi_load(argv[2], &imageWidth,
+                                            &imageHeight, &imageChannel, 4);
+    //run
+    int netInputHeight = inputTensor->height();
+    int netInputWidth  = inputTensor->width();
+    int resizeHeight = netInputHeight;
+    int resizeWidth  = netInputWidth;
+    int count_scale = 0;
+    float cur_scale = 0.0;
+    std::vector<RegRect> winList;
+    while(std::min( resizeWidth, resizeHeight ) >= NET_SIZE)
+    {
+        std::vector<int> inputDims = {1, 3, resizeHeight, resizeWidth};
+        net->resizeTensor(inputTensor, inputDims);
+        net->resizeSession(session);
+        //image preproccess
+        img_preprocess(inputImage, imageWidth, imageHeight, resizeWidth, resizeHeight, *inputTensor);
+        float cur_scale = float( imageHeight ) / resizeHeight;
+        
+        // inputTensor->copyFromHostTensor(&inputTensorUser);
+        net->runSession(session);
+        Tensor outputTensorUser1(outputTensor1, outputTensor1->getDimensionType());
+        Tensor outputTensorUser2(outputTensor2, outputTensor2->getDimensionType());
+        outputTensor1->copyToHostTensor(&outputTensorUser1);
+        outputTensor2->copyToHostTensor(&outputTensorUser2);
+
+        std::vector<int> shape = outputTensorUser1.shape();
+        float *data = outputTensorUser1.host<float>();
+        for(int i = 0; i < shape[1]; i++)
+        {
+            for(int j = 0; j < shape[2]; j++)
+            {
+                for(int k = 0; k < shape[3]; k++)
+                {
+                    printf("%f ", data[i*shape[2]*shape[3] + j*shape[3] +k]);
+                }
+                printf("\n");
+            }
+            printf("\n");
+        }
+
+        auto cls_shape = outputTensorUser1.shape();
+        auto reg_shape = outputTensorUser2.shape();
+        int n_reg = reg_shape[0];
+        int c_reg = reg_shape[1];
+        int h_reg = reg_shape[2];
+        int w_reg = reg_shape[3];
+        int n_cls = cls_shape[0];
+        int c_cls = cls_shape[1];
+        int h_cls = cls_shape[2];
+        int w_cls = cls_shape[3];
+        float *cls_data = outputTensorUser1.host<float>();
+        float *reg_data = outputTensorUser2.host<float>();
+
+        float w = NET_SIZE * cur_scale;
+        for( int i = 0; i < h_reg; i++ )
+        {
+            for( int j = 0; j < w_reg; j++ )
+            {
+                if( cls_data[( 1 * h_reg + i ) * w_reg + j] > PNET_THRESH )
+                {
+                    float sn = reg_data[( 0 * h_reg + i ) * w_reg + j];
+                    float xn = reg_data[( 1 * h_reg + i ) * w_reg + j];
+                    float yn = reg_data[( 2 * h_reg + i ) * w_reg + j];
+
+                    int rx, ry, rw;
+
+
+                    int crop_x = int( j * cur_scale * STRIDE );
+                    int crop_y = int( i * cur_scale * STRIDE );
+                    int crop_w = int( w );
+                    rx = int( crop_x - 0.5 * sn * crop_w + crop_w * sn * xn + 0.5 * crop_w );
+                    ry = int( crop_y - 0.5 * sn * crop_w + crop_w * sn * yn + 0.5 * crop_w );
+                    rw = int( sn * crop_w );
+
+
+                    if( Legal( rx, ry, imageWidth, imageHeight ) && Legal( rx + rw - 1, ry + rw - 1, imageWidth, imageHeight ) )
+                    {
+                        winList.push_back( RegRect( rx, ry, rw, rw, count_scale, cls_data[( 1 * h_reg + i ) * w_reg + j] ) );
+                    }
+                }
+            }
+        }
+
+        resizeHeight = int( resizeHeight / SCALE );
+        resizeWidth = int( resizeWidth / SCALE );
+        count_scale++;
+    }
+    winList = NMS(winList, true, PNET_NMS_THRESH);
+    
+    stbi_image_free(inputImage);
+    printf("done!\n");
+
+    return 0;
+}

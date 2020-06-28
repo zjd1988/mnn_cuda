@@ -1,0 +1,30 @@
+//
+//  ShapeIndexPatchOnnx.cpp
+//  MNNConverter
+//
+//  Created by MNN on 2019/01/31.
+//  Copyright © 2018, Alibaba Group Holding Limited
+//
+
+
+#include <stdio.h>
+#include "onnxOpConverter.hpp"
+
+DECLARE_OP_CONVERTER(ShapeIndexPatchOnnx);
+
+MNN::OpType ShapeIndexPatchOnnx::opType() {
+    return MNN::OpType_ShapeIndexPatch;
+}
+MNN::OpParameter ShapeIndexPatchOnnx::type() {
+    return MNN::OpParameter_ShapeIndexPatch;
+}
+
+void ShapeIndexPatchOnnx::run(MNN::OpT* dstOp, 
+                         const onnx::NodeProto* onnxNode, 
+                         std::vector<const onnx::TensorProto*> initializers)
+{
+    auto shapeindexpatch = new MNN::ShapeIndexPatch;
+    dstOp->main.value = shapeindexpatch;
+}
+
+REGISTER_CONVERTER(ShapeIndexPatchOnnx, ShapeIndexPatch);
